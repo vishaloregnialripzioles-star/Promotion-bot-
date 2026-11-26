@@ -22,6 +22,7 @@ if OWNER_ID <= 0:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is missing; add your Supabase PostgreSQL connection string in Render")
 
+
 def db_init():
     with psycopg.connect(DATABASE_URL) as con:
         con.execute("""
@@ -30,6 +31,14 @@ def db_init():
                 subscribed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS guild_dm_settings (
+                guild_id BIGINT PRIMARY KEY,
+                enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
 
 def is_subscribed(user_id: int) -> bool:
     with psycopg.connect(DATABASE_URL) as con:
@@ -38,6 +47,7 @@ def is_subscribed(user_id: int) -> bool:
             (user_id,),
         ).fetchone()
         return row is not None
+
 
 def set_subscription(user_id: int, enabled: bool):
     with psycopg.connect(DATABASE_URL) as con:
@@ -49,10 +59,34 @@ def set_subscription(user_id: int, enabled: bool):
         else:
             con.execute("DELETE FROM subscriptions WHERE user_id = %s", (user_id,))
 
+
 def load_subscriber_ids() -> set[int]:
     with psycopg.connect(DATABASE_URL) as con:
         rows = con.execute("SELECT user_id FROM subscriptions").fetchall()
         return {int(row[0]) for row in rows}
+
+
+def set_guild_dm_enabled(guild_id: int, enabled: bool):
+    with psycopg.connect(DATABASE_URL) as con:
+        con.execute(
+            """
+            INSERT INTO guild_dm_settings (guild_id, enabled, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (guild_id)
+            DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()
+            """,
+            (guild_id, enabled),
+        )
+
+
+def get_guild_dm_enabled(guild_id: int) -> bool:
+    with psycopg.connect(DATABASE_URL) as con:
+        row = con.execute(
+            "SELECT enabled FROM guild_dm_settings WHERE guild_id = %s",
+            (guild_id,),
+        ).fetchone()
+        return bool(row[0]) if row else False
+
 
 def promotion_embed() -> discord.Embed:
     embed = discord.Embed(
@@ -69,18 +103,6 @@ def promotion_embed() -> discord.Embed:
     embed.set_footer(text="MASTI MAZAK • Thanks for checking us out!")
     return embed
 
-def welcome_embed() -> discord.Embed:
-    return discord.Embed(
-        title="Welcome to MASTI MAZAK! 👋",
-        description=(
-            "Thanks for joining our server!\n\n"
-            "Our invite event is live: **3 invites = Dough Fruit**, with regular giveaways.\n"
-            f"[Open the server invite]({SERVER_INVITE})\n\n"
-            "Want occasional promotion updates by DM? Use **/subscribe** in the server. "
-            "You can stop them any time with **/unsubscribe**. You are not subscribed automatically."
-        ),
-        color=discord.Color.blurple(),
-    )
 
 class PromotionBot(discord.Client):
     def __init__(self):
@@ -98,13 +120,28 @@ class PromotionBot(discord.Client):
         log.info("Logged in as %s (%s)", self.user, self.user.id)
 
     async def on_member_join(self, member: discord.Member):
-        # Joining sends a one-time welcome only; it never opts the member in.
+        # Only send the promotion DM when this server's administrators enabled it.
         try:
-            await member.send(embed=welcome_embed())
+            enabled = await asyncio.to_thread(get_guild_dm_enabled, member.guild.id)
+        except Exception:
+            log.exception("Could not read join-DM setting for guild %s", member.guild.id)
+            return
+
+        if not enabled:
+            return
+
+        try:
+            await member.send(
+                content=f"Welcome to **{member.guild.name}**! Here's the server's promotion information:",
+                embed=promotion_embed(),
+            )
+            log.info("Sent join promotion DM to member %s in guild %s", member.id, member.guild.id)
         except (discord.Forbidden, discord.HTTPException):
-            log.info("Could not send welcome DM to member %s", member.id)
+            log.info("Could not send join promotion DM to member %s", member.id)
+
 
 bot = PromotionBot()
+
 
 @bot.tree.command(name="subscribe", description="Opt in to occasional MASTI MAZAK promotion DMs")
 async def subscribe(interaction: discord.Interaction):
@@ -114,6 +151,7 @@ async def subscribe(interaction: discord.Interaction):
         ephemeral=True,
     )
 
+
 @bot.tree.command(name="unsubscribe", description="Stop receiving promotion DMs")
 async def unsubscribe(interaction: discord.Interaction):
     await asyncio.to_thread(set_subscription, interaction.user.id, False)
@@ -121,6 +159,69 @@ async def unsubscribe(interaction: discord.Interaction):
         "✅ You're unsubscribed. You won't receive future promotion broadcasts.",
         ephemeral=True,
     )
+
+
+dm_group = app_commands.Group(name="dm", description="Control the automatic join promotion DM")
+
+
+@dm_group.command(name="on", description="Enable one welcome promotion DM for new members")
+async def dm_on(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True)
+        return
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "Only server administrators with Manage Server permission can change this setting.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        await asyncio.to_thread(set_guild_dm_enabled, interaction.guild.id, True)
+    except Exception:
+        log.exception("Could not enable join DMs for guild %s", interaction.guild.id)
+        await interaction.response.send_message(
+            "I couldn't save this setting because the database is unavailable. Please try again later.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        "✅ Automatic join promotion DMs are now **ON** for this server. New members will receive one DM when they join. Existing members won't be messaged.",
+        ephemeral=True,
+    )
+
+
+@dm_group.command(name="off", description="Disable automatic join promotion DMs")
+async def dm_off(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True)
+        return
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "Only server administrators with Manage Server permission can change this setting.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        await asyncio.to_thread(set_guild_dm_enabled, interaction.guild.id, False)
+    except Exception:
+        log.exception("Could not disable join DMs for guild %s", interaction.guild.id)
+        await interaction.response.send_message(
+            "I couldn't save this setting because the database is unavailable. Please try again later.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        "✅ Automatic join promotion DMs are now **OFF** for this server.",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(dm_group)
+
 
 @bot.tree.command(name="dmall", description="Send the promotion to members who opted in")
 @app_commands.describe(confirm="Set this to true to confirm the opted-in broadcast")
@@ -152,7 +253,6 @@ async def dmall(interaction: discord.Interaction, confirm: bool):
         )
         return
 
-    # Fetch only members who explicitly subscribed, rather than scanning the whole server.
     targets = []
     for user_id in opted_ids:
         try:
@@ -185,8 +285,10 @@ async def dmall(interaction: discord.Interaction, confirm: bool):
     except (discord.Forbidden, discord.HTTPException):
         log.warning("Could not DM the owner delivery report")
 
+
 async def health(_request):
     return web.json_response({"status": "ok", "bot_ready": bot.is_ready()})
+
 
 async def start_health_server():
     app = web.Application()
@@ -199,9 +301,11 @@ async def start_health_server():
     await site.start()
     log.info("Health server listening on port %s", port)
 
+
 async def main():
     await start_health_server()
     await bot.start(TOKEN)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
