@@ -1,6 +1,6 @@
 # MASTI MAZAK Promotion Bot
 
-A Discord bot with a one-time welcome DM, opt-in promotion updates, and an owner/admin command for opted-in broadcasts. Subscription records are stored in Supabase PostgreSQL.
+A Discord bot with admin-controlled automatic join promotion DMs, opt-in promotion updates, and an owner/admin command for opted-in broadcasts. Subscription and per-server DM settings are stored in Supabase PostgreSQL.
 
 ## Render Web Service
 
@@ -27,25 +27,23 @@ Render provides `PORT` automatically.
 5. Set the key to `DATABASE_URL` and paste the connection string as its value. Do not put the password in GitHub or share it in chat.
 6. Save the variable and redeploy.
 
-The bot creates the `subscriptions` table automatically at startup; you do not need to run SQL manually. If your database password contains URI-reserved characters, use the connection URI supplied by Supabase or URL-encode the password.
+The bot creates the `subscriptions` and `guild_dm_settings` tables automatically at startup; you do not need to run SQL manually. If your database password contains URI-reserved characters, use the connection URI supplied by Supabase or URL-encode the password.
 
 ## Discord setup
 
 1. Enable **Server Members Intent** in the Discord Developer Portal.
 2. Invite the bot with the `bot` and `applications.commands` scopes.
 3. Give it permission to view the server and send messages/DMs.
-4. Members use `/subscribe` to opt in and `/unsubscribe` to opt out.
-5. Use `/dmall confirm:true` to send only to members who opted in.
+4. A server administrator with **Manage Server** permission can run `/dm on` to enable one promotion DM for each new member joining that server.
+5. Run `/dm off` to disable automatic join DMs. The setting is saved separately for each server and survives redeployments.
+6. Members can use `/subscribe` to opt in to occasional promotion updates and `/unsubscribe` to opt out.
+7. Use `/dmall confirm:true` to send a promotion only to members who explicitly opted in.
 
-New members receive one welcome DM explaining the server and how to opt in. Joining does not subscribe them automatically. The bot does not scrape members or send unsolicited broadcast DMs.
+When `/dm on` is enabled, only members who join after it is enabled receive the one-time promotion DM. Existing members are not messaged. If a member has DMs closed, the bot logs the delivery failure and continues normally. Automatic join DMs do not subscribe members to broadcasts.
 
 ## Database
 
-At startup, the bot creates this table if it does not already exist:
+At startup, the bot creates these tables if they do not already exist:
 
-```sql
-CREATE TABLE IF NOT EXISTS subscriptions (
-    user_id BIGINT PRIMARY KEY,
-    subscribed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-```
+- `subscriptions`: members who opted in to promotion broadcasts.
+- `guild_dm_settings`: whether automatic join DMs are enabled for each server.
