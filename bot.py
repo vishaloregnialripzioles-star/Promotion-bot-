@@ -1,10 +1,9 @@
 import os
 import asyncio
 import logging
-import sqlite3
-from contextlib import closing
 
 import discord
+import psycopg
 from discord import app_commands
 from aiohttp import web
 
@@ -14,33 +13,46 @@ log = logging.getLogger("promotion-bot")
 TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 SERVER_INVITE = os.getenv("SERVER_INVITE", "https://discord.gg/UFvjK5Uy5e")
-DB_PATH = os.getenv("DB_PATH", "subscriptions.sqlite3")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing")
 if OWNER_ID <= 0:
     raise RuntimeError("Set OWNER_ID to your Discord user ID")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is missing; add your Supabase PostgreSQL connection string in Render")
 
 def db_init():
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
-            user_id INTEGER PRIMARY KEY,
-            subscribed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )""")
-        con.commit()
+    with psycopg.connect(DATABASE_URL) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id BIGINT PRIMARY KEY,
+                subscribed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
 
 def is_subscribed(user_id: int) -> bool:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        row = con.execute("SELECT 1 FROM subscriptions WHERE user_id=?", (user_id,)).fetchone()
+    with psycopg.connect(DATABASE_URL) as con:
+        row = con.execute(
+            "SELECT 1 FROM subscriptions WHERE user_id = %s",
+            (user_id,),
+        ).fetchone()
         return row is not None
 
 def set_subscription(user_id: int, enabled: bool):
-    with closing(sqlite3.connect(DB_PATH)) as con:
+    with psycopg.connect(DATABASE_URL) as con:
         if enabled:
-            con.execute("INSERT OR IGNORE INTO subscriptions(user_id) VALUES (?)", (user_id,))
+            con.execute(
+                "INSERT INTO subscriptions (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+                (user_id,),
+            )
         else:
-            con.execute("DELETE FROM subscriptions WHERE user_id=?", (user_id,))
-        con.commit()
+            con.execute("DELETE FROM subscriptions WHERE user_id = %s", (user_id,))
+
+def load_subscriber_ids() -> set[int]:
+    with psycopg.connect(DATABASE_URL) as con:
+        rows = con.execute("SELECT user_id FROM subscriptions").fetchall()
+        return {int(row[0]) for row in rows}
 
 def promotion_embed() -> discord.Embed:
     embed = discord.Embed(
@@ -58,7 +70,7 @@ def promotion_embed() -> discord.Embed:
     return embed
 
 def welcome_embed() -> discord.Embed:
-    embed = discord.Embed(
+    return discord.Embed(
         title="Welcome to MASTI MAZAK! 👋",
         description=(
             "Thanks for joining our server!\n\n"
@@ -69,7 +81,6 @@ def welcome_embed() -> discord.Embed:
         ),
         color=discord.Color.blurple(),
     )
-    return embed
 
 class PromotionBot(discord.Client):
     def __init__(self):
@@ -79,7 +90,7 @@ class PromotionBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        db_init()
+        await asyncio.to_thread(db_init)
         await self.tree.sync()
         log.info("Global application commands synced")
 
@@ -87,7 +98,7 @@ class PromotionBot(discord.Client):
         log.info("Logged in as %s (%s)", self.user, self.user.id)
 
     async def on_member_join(self, member: discord.Member):
-        # One-time welcome message only; joining does not subscribe the member.
+        # Joining sends a one-time welcome only; it never opts the member in.
         try:
             await member.send(embed=welcome_embed())
         except (discord.Forbidden, discord.HTTPException):
@@ -97,7 +108,7 @@ bot = PromotionBot()
 
 @bot.tree.command(name="subscribe", description="Opt in to occasional MASTI MAZAK promotion DMs")
 async def subscribe(interaction: discord.Interaction):
-    set_subscription(interaction.user.id, True)
+    await asyncio.to_thread(set_subscription, interaction.user.id, True)
     await interaction.response.send_message(
         "✅ You're subscribed to occasional promotion updates. Use /unsubscribe any time.",
         ephemeral=True,
@@ -105,7 +116,7 @@ async def subscribe(interaction: discord.Interaction):
 
 @bot.tree.command(name="unsubscribe", description="Stop receiving promotion DMs")
 async def unsubscribe(interaction: discord.Interaction):
-    set_subscription(interaction.user.id, False)
+    await asyncio.to_thread(set_subscription, interaction.user.id, False)
     await interaction.response.send_message(
         "✅ You're unsubscribed. You won't receive future promotion broadcasts.",
         ephemeral=True,
@@ -131,8 +142,28 @@ async def dmall(interaction: discord.Interaction, confirm: bool):
         return
 
     await interaction.response.defer(ephemeral=True, thinking=True)
-    opted_ids = await asyncio.to_thread(load_subscriber_ids)
-    targets = [m for m in interaction.guild.members if m.id in opted_ids and not m.bot]
+    try:
+        opted_ids = await asyncio.to_thread(load_subscriber_ids)
+    except Exception:
+        log.exception("Could not load subscriptions from Supabase")
+        await interaction.followup.send(
+            "The subscription database is temporarily unavailable. No messages were sent.",
+            ephemeral=True,
+        )
+        return
+
+    # Fetch only members who explicitly subscribed, rather than scanning the whole server.
+    targets = []
+    for user_id in opted_ids:
+        try:
+            member = await interaction.guild.fetch_member(user_id)
+            if not member.bot:
+                targets.append(member)
+        except discord.NotFound:
+            continue
+        except (discord.Forbidden, discord.HTTPException):
+            log.warning("Could not look up opted-in member %s", user_id)
+
     sent = 0
     failed = 0
     for member in targets:
@@ -141,19 +172,18 @@ async def dmall(interaction: discord.Interaction, confirm: bool):
             sent += 1
         except (discord.Forbidden, discord.HTTPException):
             failed += 1
-        await asyncio.sleep(1.2)  # conservative pacing
+        await asyncio.sleep(1.2)
 
-    summary = f"Broadcast finished. Sent: **{sent}** • Failed: **{failed}** • Opted-in members found: **{len(targets)}**."
+    summary = (
+        f"Broadcast finished. Sent: **{sent}** • Failed: **{failed}** "
+        f"• Opted-in members found: **{len(targets)}**."
+    )
     await interaction.followup.send(summary, ephemeral=True)
     try:
         owner = await bot.fetch_user(OWNER_ID)
         await owner.send(f"📊 **MASTI MAZAK delivery report**\n{summary}")
     except (discord.Forbidden, discord.HTTPException):
         log.warning("Could not DM the owner delivery report")
-
-def load_subscriber_ids() -> set[int]:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        return {int(row[0]) for row in con.execute("SELECT user_id FROM subscriptions").fetchall()}
 
 async def health(_request):
     return web.json_response({"status": "ok", "bot_ready": bot.is_ready()})
